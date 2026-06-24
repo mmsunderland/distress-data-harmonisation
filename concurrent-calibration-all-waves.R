@@ -548,12 +548,12 @@ generate_reference_wave_scores_with_ids <- function(reference_wave_data, concurr
   
   # Score participants
   if (software == "mirt") {
-    scores <- extract_mirt_scores_and_ses_improved(model, valid_item_responses)
+    scores <- score_with_eap_fscores(model, valid_item_responses)
     theta_scores <- scores$theta
     theta_se <- scores$se
-    cat("Improved mirt scoring completed for reference wave\n")
+    cat("mirt EAP scoring completed for reference wave\n")
     cat("Method used:", scores$method, "\n")
-    cat("Participants with default SEs:", scores$n_default_ses, "\n")
+    cat("Participants with fallback MAP scoring:", scores$n_failed, "\n")
     
   } else {
     person_estimates <- tam.wle(model, resp = as.matrix(valid_item_responses))
@@ -674,66 +674,13 @@ score_subsequent_waves_with_item_filtering <- function(all_waves_data, reference
   
   # SCORING with the complete item matrix
   if (software == "mirt") {
-    cat("Using enhanced mirt scoring for subsequent waves...\n")
-    
-    # Initialize variables to avoid scope issues
-    theta_scores <- rep(0, nrow(valid_item_responses))
-    theta_se <- rep(0.5, nrow(valid_item_responses))
-    
-    tryCatch({
-      cat("  - Attempting full.scores = TRUE with complete item matrix...\n")
-      
-      full_scores <- fscores(model, 
-                             response.pattern = valid_item_responses,
-                             method = "EAP",
-                             full.scores = TRUE,
-                             full.scores.SE = TRUE,
-                             verbose = FALSE)
-      
-      if (is.matrix(full_scores) && ncol(full_scores) >= 2) {
-        theta_scores <- full_scores[, 1]
-        
-        se_cols <- grep("SE", colnames(full_scores), ignore.case = TRUE)
-        if (length(se_cols) > 0) {
-          theta_se <- full_scores[, se_cols[1]]
-          
-          # Validate SEs
-          valid_ses <- !is.na(theta_se) & theta_se > 0.01 & theta_se < 5
-          n_valid_ses <- sum(valid_ses)
-          
-          cat("  Enhanced scoring successful with", n_valid_ses, "valid SEs\n")
-          
-          if (n_valid_ses < length(theta_se)) {
-            cat("  - Calculating SEs for remaining", length(theta_se) - n_valid_ses, "participants...\n")
-            calculated_ses <- calculate_manual_ses_for_subsequent(model, valid_item_responses, theta_scores)
-            theta_se[!valid_ses] <- calculated_ses[!valid_ses]
-          }
-          
-        } else {
-          theta_se <- calculate_manual_ses_for_subsequent(model, valid_item_responses, theta_scores)
-        }
-        
-      } else {
-        stop("Unexpected output format")
-      }
-      
-    }, error = function(e) {
-      cat("  Enhanced scoring failed:", e$message, "\n")
-      cat("  - Using fallback method...\n")
-      
-      theta_scores <<- tryCatch({
-        scores <- fscores(model, response.pattern = valid_item_responses, method = "EAP", verbose = FALSE)
-        if (is.matrix(scores)) scores[, 1] else as.numeric(scores)
-      }, error = function(e2) {
-        rep(0, nrow(valid_item_responses))
-      })
-      
-      theta_se <<- calculate_manual_ses_for_subsequent(model, valid_item_responses, theta_scores)
-    })
-    
+    cat("Using mirt EAP scoring for subsequent waves...\n")
+    scores <- score_with_eap_fscores(model, valid_item_responses)
+    theta_scores <- scores$theta
+    theta_se <- scores$se
     cat("  Subsequent wave scoring completed\n")
-    cat("  - Participants with SE = 0.5:", sum(abs(theta_se - 0.5) < 0.001), "\n")
-    
+    cat("  - Participants with fallback MAP scoring:", scores$n_failed, "\n")
+
   } else {
     # TAM scoring
     person_estimates <- tam.wle(model, resp = valid_item_responses)
@@ -775,166 +722,81 @@ score_subsequent_waves_with_item_filtering <- function(all_waves_data, reference
   return(subsequent_scores)
 }
 
-# IMPROVED MIRT SCORING WITH SE CALCULATION
-extract_mirt_scores_and_ses_improved <- function(model, response_data) {
-  
-  cat("Extracting scores using improved mirt SE calculation...\n")
-  
-  # Ensure response_data is properly formatted as numeric matrix
+# UNIFIED EAP SCORING WITH MAP FALLBACK
+score_with_eap_fscores <- function(model, response_data) {
+
   if (!is.matrix(response_data)) {
     response_data <- as.matrix(response_data)
   }
   response_data <- apply(response_data, 2, as.numeric)
-  
   n_participants <- nrow(response_data)
-  cat("Processing", n_participants, "participants...\n")
-  
-  # Try full.scores = TRUE first (most reliable)
-  cat("Attempting full scoring with built-in SEs...\n")
-  
+
+  cat("Scoring", n_participants, "participants using EAP fscores...\n")
+
+  theta <- rep(NA_real_, n_participants)
+  se    <- rep(NA_real_, n_participants)
+
   full_scores <- tryCatch({
-    fscores(model, 
+    fscores(model,
             response.pattern = response_data,
             method = "EAP",
             full.scores = TRUE,
             full.scores.SE = TRUE,
             verbose = FALSE)
   }, error = function(e) {
-    cat("Full scoring failed:", e$message, "\n")
-    return(NULL)
+    cat("EAP fscores failed:", e$message, "\n")
+    NULL
   })
-  
+
   if (!is.null(full_scores) && is.matrix(full_scores) && ncol(full_scores) >= 2) {
-    theta_scores <- full_scores[, 1]
-    
-    # Look for SE columns
+    theta <- full_scores[, 1]
     se_cols <- grep("SE", colnames(full_scores), ignore.case = TRUE)
     if (length(se_cols) > 0) {
-      theta_ses <- full_scores[, se_cols[1]]
-      
-      # Validate SEs
-      valid_ses <- !is.na(theta_ses) & theta_ses > 0 & theta_ses < 5
-      n_valid_ses <- sum(valid_ses)
-      
-      cat("Full scoring successful with built-in SEs\n")
-      cat("Valid SEs for", n_valid_ses, "out of", n_participants, "participants\n")
-      
-      # Replace invalid SEs with calculated ones
-      if (n_valid_ses < n_participants) {
-        cat("Calculating SEs for", n_participants - n_valid_ses, "participants with invalid SEs...\n")
-        calculated_ses <- calculate_improved_eap_ses(model, response_data, theta_scores)
-        theta_ses[!valid_ses] <- calculated_ses[!valid_ses]
-      }
-      
-      return(list(
-        theta = theta_scores,
-        se = theta_ses,
-        method = "full_scores_with_builtin_SE",
-        n_default_ses = n_participants - n_valid_ses
-      ))
+      se <- full_scores[, se_cols[1]]
     }
   }
-  
-  # Method 2: Individual scoring with improved SE calculation
-  cat("Using individual scoring with improved SE calculation...\n")
-  
-  # Get theta scores
-  theta_scores <- tryCatch({
-    scores <- fscores(model, 
-                      response.pattern = response_data,
-                      method = "EAP", 
-                      verbose = FALSE)
-    if (is.matrix(scores)) scores[, 1] else as.numeric(scores)
-  }, error = function(e) {
-    cat("Error in theta scoring:", e$message, "\n")
-    rep(0, n_participants)
-  })
-  
-  # Calculate improved SEs
-  theta_ses <- calculate_improved_eap_ses(model, response_data, theta_scores)
-  
-  return(list(
-    theta = theta_scores,
-    se = theta_ses,
-    method = "individual_with_improved_SE",
-    n_default_ses = sum(abs(theta_ses - 0.5) < 0.001)
-  ))
-}
 
-# IMPROVED SE CALCULATION METHOD
-calculate_improved_eap_ses <- function(model, response_data, theta_scores) {
-  
-  n_persons <- nrow(response_data)
-  ses <- numeric(n_persons)
-  
-  # Get item parameters once (more efficient)
-  item_params <- tryCatch({
-    params <- coef(model, simplify = TRUE)
-    list(
-      discriminations = params$items[, "a1"],
-      success = TRUE
-    )
-  }, error = function(e) {
-    cat("Could not extract parameters for SE calculation\n")
-    list(success = FALSE)
-  })
-  
-  if (!item_params$success) {
-    cat("Using default SEs due to parameter extraction failure\n")
-    return(rep(0.5, n_persons))
-  }
-  
-  # Process in batches for efficiency
-  batch_size <- 500
-  n_batches <- ceiling(n_persons / batch_size)
-  
-  for (batch in 1:n_batches) {
-    start_idx <- (batch - 1) * batch_size + 1
-    end_idx <- min(batch * batch_size, n_persons)
-    
-    for (i in start_idx:end_idx) {
-      response_pattern <- response_data[i, ]
-      valid_items <- !is.na(response_pattern)
-      theta_est <- theta_scores[i]
-      
-      if (sum(valid_items) == 0) {
-        ses[i] <- 1.0
-        next
-      }
-      
-      # Calculate test information for valid items only
-      test_info <- 0
-      for (j in which(valid_items)) {
-        a <- item_params$discriminations[j]
-        if (!is.na(a) && a > 0) {
-          # Simplified information calculation
-          p <- 1 / (1 + exp(-1.7 * a * theta_est))
-          item_info <- (1.7 * a)^2 * p * (1 - p)
-          test_info <- test_info + item_info
-        }
-      }
-      
-      # EAP SE calculation with proper bounds
-      if (test_info > 0.01) {
-        prior_precision <- 1.0
-        total_precision <- test_info + prior_precision
-        ses[i] <- sqrt(1.0 / total_precision)
-      } else {
-        ses[i] <- 1.0
-      }
-      
-      # Apply reasonable bounds
-      ses[i] <- pmax(0.1, pmin(ses[i], 2.0))
+  # Fall back to MAP for participants with invalid EAP results
+  failed  <- is.na(theta) | is.na(se) | se <= 0 | se >= 5
+  n_failed <- sum(failed)
+
+  if (n_failed > 0) {
+    cat("Falling back to MAP for", n_failed, "participants with invalid EAP results...\n")
+    failed_responses <- response_data[failed, , drop = FALSE]
+
+    map_scores <- tryCatch({
+      fscores(model,
+              response.pattern = failed_responses,
+              method = "MAP",
+              full.scores = TRUE,
+              full.scores.SE = TRUE,
+              verbose = FALSE)
+    }, error = function(e) {
+      cat("MAP fscores also failed:", e$message, "\n")
+      NULL
+    })
+
+    if (!is.null(map_scores) && is.matrix(map_scores) && ncol(map_scores) >= 2) {
+      map_theta   <- map_scores[, 1]
+      map_se_cols <- grep("SE", colnames(map_scores), ignore.case = TRUE)
+      map_se <- if (length(map_se_cols) > 0) map_scores[, map_se_cols[1]] else rep(NA_real_, sum(failed))
+      theta[failed] <- map_theta
+      se[failed]    <- map_se
     }
-    
-    if (batch %% 10 == 0 || batch == n_batches) {
-      cat("  Processed batch", batch, "of", n_batches, "\n")
-    }
+    # Participants where both EAP and MAP failed retain NA
   }
-  
-  cat("SE calculation completed. Range:", round(min(ses), 3), "to", round(max(ses), 3), "\n")
-  
-  return(ses)
+
+  n_na_se <- sum(is.na(se))
+  if (n_na_se > 0) {
+    cat("SE is NA for", n_na_se, "participants (both EAP and MAP failed).\n")
+  }
+
+  return(list(
+    theta    = theta,
+    se       = se,
+    method   = "EAP_fscores_with_MAP_fallback",
+    n_failed = n_failed
+  ))
 }
 
 # SIMPLE RESPONSE CATEGORY VALIDATION
@@ -980,8 +842,8 @@ validate_and_fix_response_categories_simple <- function(response_data, model, fi
             
             # Correct the responses to fit expected range
             corrected_responses <- response_data[, item_name]
-            corrected_responses[corrected_responses < expected_min & !is.na(corrected_responses)] <- expected_min
-            corrected_responses[corrected_responses > expected_max & !is.na(corrected_responses)] <- expected_max
+            corrected_responses[corrected_responses < expected_min & !is.na(corrected_responses)] <- NA
+            corrected_responses[corrected_responses > expected_max & !is.na(corrected_responses)] <- NA
             
             corrected_data[, item_name] <- corrected_responses
             corrections_made <- corrections_made + 1
@@ -991,7 +853,7 @@ validate_and_fix_response_categories_simple <- function(response_data, model, fi
     }
     
     if (corrections_made > 0) {
-      cat("    Corrected", corrections_made, "items with category mismatches\n")
+      cat("    Set out-of-range responses to NA in", corrections_made, "items\n")
     } else {
       cat("    All response categories match model expectations\n")
     }
@@ -1002,64 +864,6 @@ validate_and_fix_response_categories_simple <- function(response_data, model, fi
     cat("    Category validation failed, using original data:", e$message, "\n")
     return(response_data)
   })
-}
-
-calculate_manual_ses_for_subsequent <- function(model, response_matrix, theta_scores) {
-  
-  cat("    Calculating SEs manually using Fisher Information...\n")
-  
-  n_persons <- nrow(response_matrix)
-  ses <- numeric(n_persons)
-  
-  # Extract item parameters
-  tryCatch({
-    item_params <- coef(model, simplify = TRUE)
-    discriminations <- item_params$items[, "a1"]
-    
-    for (i in 1:n_persons) {
-      response_pattern <- response_matrix[i, ]
-      valid_items <- !is.na(response_pattern)
-      theta_est <- theta_scores[i]
-      
-      if (sum(valid_items) == 0) {
-        ses[i] <- 1.0
-        next
-      }
-      
-      # Calculate test information for valid items
-      test_info <- 0
-      for (j in which(valid_items)) {
-        a <- discriminations[j]
-        
-        if (!is.na(a) && a > 0) {
-          # Simplified 2PL information formula
-          p <- 1 / (1 + exp(-1.7 * a * theta_est))
-          item_info <- (1.7 * a)^2 * p * (1 - p)
-          test_info <- test_info + item_info
-        }
-      }
-      
-      # Calculate SE using Fisher Information
-      if (test_info > 0.01) {
-        prior_precision <- 1.0
-        total_precision <- test_info + prior_precision
-        ses[i] <- sqrt(1.0 / total_precision)
-      } else {
-        ses[i] <- 1.0
-      }
-      
-      # Apply reasonable bounds
-      ses[i] <- pmax(0.05, pmin(ses[i], 2.0))
-    }
-    
-  }, error = function(e) {
-    ses[] <- 0.5
-  })
-  
-  cat("    Manual SE calculation completed\n")
-  cat("    SE range:", round(min(ses), 3), "to", round(max(ses), 3), "\n")
-  
-  return(ses)
 }
 
 # COMBINE SCORES WITH ID PRESERVATION

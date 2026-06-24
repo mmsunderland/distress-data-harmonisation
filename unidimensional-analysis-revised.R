@@ -700,22 +700,42 @@ analyze_within_study_bifactor <- function(data, all_items, min_participants) {
     
     # Omega (bifactor) analysis with polychoric correlations for ordinal data
     cat("  Running omega (bifactor) analysis with polychoric correlations...\n")
-    
+
+    # nfactors fixed at 3 for comparability across studies; reduced only for
+    # small item sets to avoid estimation failures
+    n_items_study <- ncol(study_complete)
+    if (n_items_study < 6) {
+      nfactors_use <- 1
+      cat("  Note: nfactors reduced to 1 (fewer than 6 items)\n")
+    } else if (n_items_study < 9) {
+      nfactors_use <- 2
+      cat("  Note: nfactors reduced to 2 (fewer than 9 items)\n")
+    } else {
+      nfactors_use <- 3
+    }
+
     omega_result <- tryCatch({
-      omega(study_complete, 
-            nfactors = min(3, floor(ncol(study_complete) / 3)),
-            fm = "minres",        # Minimum residual method works better with polychoric
-            poly = TRUE,          # Use polychoric correlations for ordinal data
+      omega(study_complete,
+            nfactors = nfactors_use,
+            fm = "minres",
+            poly = TRUE,
             rotate = "oblimin",
             plot = FALSE)
     }, error = function(e) NULL)
-    
+
     if (!is.null(omega_result)) {
-      omega_h <- omega_result$omega_h
+      omega_h    <- omega_result$omega_h
       omega_total <- omega_result$omega.tot
-      pev_general <- omega_result$omega.group[1, 1]
-      
-      cat("    Omega hierarchical (ωh):", round(omega_h, 3))
+
+      # ECV = proportion of common variance explained by the general factor
+      # (Rodriguez et al., 2016, Psychological Methods: values above 0.60
+      # are generally indicative of a dominant general factor)
+      general_loadings <- omega_result$schmid$sl[, "g"]
+      all_loadings     <- omega_result$schmid$sl
+      common_loadings  <- all_loadings[, colnames(all_loadings) != "u2"]
+      ecv <- sum(general_loadings^2) / sum(common_loadings^2)
+
+      cat("    Omega hierarchical (omega_h):", round(omega_h, 3))
       if (omega_h > 0.70) {
         cat(" ✅\n")
       } else if (omega_h > 0.50) {
@@ -723,10 +743,9 @@ analyze_within_study_bifactor <- function(data, all_items, min_participants) {
       } else {
         cat(" 🚨\n")
       }
-      
       cat("    Omega total:", round(omega_total, 3), "\n")
-      cat("    % variance by general:", round(pev_general * 100, 1), "%\n")
-      
+      cat("    ECV (general factor):", round(ecv * 100, 1), "%\n")
+
       bifactor_results[[study]] <- list(
         study = study,
         sufficient_data = TRUE,
@@ -736,8 +755,7 @@ analyze_within_study_bifactor <- function(data, all_items, min_participants) {
         available_items = available_items,
         omega_h = omega_h,
         omega_total = omega_total,
-        pev_general = pev_general,
-        omega_result = omega_result
+        ecv = ecv
       )
     } else {
       cat("    ❌ Bifactor analysis failed\n")
@@ -856,22 +874,31 @@ generate_refined_summary <- function(network_results, polychor_results,
   # Within-study bifactor summary
   if (within_study_bifactor$n_successful > 0) {
     omega_h_values <- sapply(within_study_bifactor$study_results, function(x) {
-      if(!is.null(x$omega_h)) x$omega_h else NA
+      if (!is.null(x$omega_h)) x$omega_h else NA
     })
     omega_h_values <- omega_h_values[!is.na(omega_h_values)]
-    
+
+    ecv_values <- sapply(within_study_bifactor$study_results, function(x) {
+      if (!is.null(x$ecv)) x$ecv else NA
+    })
+    ecv_values <- ecv_values[!is.na(ecv_values)]
+
     bifactor_summary <- list(
-      n_studies_analyzed = within_study_bifactor$n_successful,
-      mean_omega_h = mean(omega_h_values, na.rm = TRUE),
-      prop_strong_general = mean(omega_h_values > 0.70, na.rm = TRUE),
-      prop_moderate_general = mean(omega_h_values > 0.50, na.rm = TRUE)
+      n_studies_analyzed    = within_study_bifactor$n_successful,
+      mean_omega_h          = mean(omega_h_values, na.rm = TRUE),
+      prop_strong_general   = mean(omega_h_values > 0.70, na.rm = TRUE),
+      prop_moderate_general = mean(omega_h_values > 0.50, na.rm = TRUE),
+      mean_ecv              = mean(ecv_values, na.rm = TRUE),
+      prop_dominant_general = mean(ecv_values > 0.60, na.rm = TRUE)
     )
   } else {
     bifactor_summary <- list(
-      n_studies_analyzed = 0,
-      mean_omega_h = NA,
-      prop_strong_general = NA,
-      prop_moderate_general = NA
+      n_studies_analyzed    = 0,
+      mean_omega_h          = NA,
+      prop_strong_general   = NA,
+      prop_moderate_general = NA,
+      mean_ecv              = NA,
+      prop_dominant_general = NA
     )
   }
   
@@ -1117,45 +1144,44 @@ plot_within_study_unidim <- function(within_study_unidim) {
 }
 
 plot_within_study_omega <- function(within_study_bifactor) {
-  
-  # Extract omega values
+
+  # Extract omega and ECV values
   omega_data <- data.frame()
   for (study in names(within_study_bifactor$study_results)) {
     result <- within_study_bifactor$study_results[[study]]
     if (!is.null(result$sufficient_data) && result$sufficient_data) {
       omega_data <- rbind(omega_data, data.frame(
-        Study = study,
-        Omega_H = result$omega_h,
+        Study       = study,
+        Omega_H     = result$omega_h,
         Omega_Total = result$omega_total,
-        PEV_General = result$pev_general,
         stringsAsFactors = FALSE
       ))
     }
   }
-  
+
   if (nrow(omega_data) == 0) {
     return(NULL)
   }
-  
+
   omega_data_long <- omega_data %>%
     pivot_longer(cols = c(Omega_H, Omega_Total),
-                 names_to = "Omega_Type",
+                 names_to = "Metric",
                  values_to = "Value")
-  
-  p <- ggplot(omega_data_long, aes(x = reorder(Study, Value), y = Value, fill = Omega_Type)) +
+
+  p <- ggplot(omega_data_long, aes(x = reorder(Study, Value), y = Value, fill = Metric)) +
     geom_bar(stat = "identity", position = "dodge") +
     geom_hline(yintercept = 0.70, linetype = "dashed", color = "yellow") +
     geom_hline(yintercept = 0.50, linetype = "dashed", color = "purple") +
     coord_flip() +
-    labs(title = "Within-Study Bifactor Reliability",
-         subtitle = "Yellow line: Strong general factor (ωh > 0.70) | Purple line: Moderate (ωh > 0.50)",
+    labs(title = "Within-Study Reliability and General Factor Dominance",
+         subtitle = paste0("Yellow: omega_h > 0.70 (strong) | Purple: omega_h > 0.50 (moderate) | "),
          x = "Study",
-         y = "Omega Value",
-         fill = "Reliability Type") +
+         y = "Value",
+         fill = "Metric") +
     theme_minimal() +
     theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
           plot.subtitle = element_text(hjust = 0.5, size = 9))
-  
+
   return(p)
 }
 
@@ -1229,9 +1255,9 @@ export_refined_results <- function(network_results, polychor_results,
       N_Participants = result$n_participants,
       N_Items = result$n_items,
       N_Complete = if(!is.null(result$n_complete)) result$n_complete else NA,
-      Omega_H = if(!is.null(result$omega_h)) result$omega_h else NA,
-      Omega_Total = if(!is.null(result$omega_total)) result$omega_total else NA,
-      PEV_General = if(!is.null(result$pev_general)) result$pev_general else NA,
+      Omega_H = if (!is.null(result$omega_h)) result$omega_h else NA,
+      Omega_Total = if (!is.null(result$omega_total)) result$omega_total else NA,
+      ECV = if (!is.null(result$ecv)) result$ecv else NA,
       stringsAsFactors = FALSE
     ))
   }
@@ -1393,7 +1419,7 @@ print_refined_summary <- function(results) {
   cat("   Studies analyzed:", summary$within_study_bifactor$n_studies_analyzed, "\n")
   if (summary$within_study_bifactor$n_studies_analyzed > 0) {
     cat("   Mean omega hierarchical:", round(summary$within_study_bifactor$mean_omega_h, 3), "\n")
-    cat("   Proportion with strong general (ωh > 0.70):", 
+    cat("   Proportion with strong general (omega_h > 0.70):",
         round(summary$within_study_bifactor$prop_strong_general, 2))
     if (summary$within_study_bifactor$prop_strong_general > 0.75) {
       cat(" ✅\n")
@@ -1402,8 +1428,19 @@ print_refined_summary <- function(results) {
     } else {
       cat(" 🚨\n")
     }
-    cat("   Proportion with moderate+ general (ωh > 0.50):",
+    cat("   Proportion with moderate+ general (omega_h > 0.50):",
         round(summary$within_study_bifactor$prop_moderate_general, 2), "\n")
+    cat("   Mean ECV (general factor):",
+        round(summary$within_study_bifactor$mean_ecv, 3), "\n")
+    cat("   Proportion with dominant general (ECV > 0.60):",
+        round(summary$within_study_bifactor$prop_dominant_general, 2))
+    if (summary$within_study_bifactor$prop_dominant_general > 0.75) {
+      cat(" ✅\n")
+    } else if (summary$within_study_bifactor$prop_dominant_general > 0.50) {
+      cat(" ⚠️\n")
+    } else {
+      cat(" 🚨\n")
+    }
   }
   cat("\n")
   

@@ -75,18 +75,18 @@ identify_anchor_coverage <- function(data, anchor_items, study_var = "Study",
 # STEP 2: PURIFICATION STAGE - IDENTIFY DIF-FREE ANCHORS
 # =============================================================================
 
-purify_anchors <- function(data, anchor_items, study1, study2, 
+purify_anchors <- function(data, anchor_items, study1, study2,
                            study_var = "Study", min_anchors = 3,
                            cfi_threshold = 0.01, tli_threshold = 0.01) {
-  
+
   cat(sprintf("\nSTEP 2: ANCHOR PURIFICATION FOR %s vs %s\n", study1, study2))
   cat("=================================================\n\n")
-  
+
   # Filter to relevant studies
   pair_data <- data %>%
     filter(!!sym(study_var) %in% c(study1, study2)) %>%
     mutate(group = as.factor(!!sym(study_var)))
-  
+
   # Remove items with insufficient variation
   valid_anchors <- anchor_items[sapply(anchor_items, function(item) {
     if (!item %in% names(pair_data)) return(FALSE)
@@ -94,92 +94,122 @@ purify_anchors <- function(data, anchor_items, study1, study2,
     n_unique <- length(unique(pair_data[[item]][!is.na(pair_data[[item]])]))
     return(n_valid >= 20 && n_unique >= 2)
   })]
-  
+
   if (length(valid_anchors) < min_anchors) {
     cat("Insufficient valid anchors for testing\n")
     return(NULL)
   }
-  
-  # Test each item for DIF using all others as anchors
+
+  # --- Estimate shared reference model ONCE (all valid anchors constrained) ---
+  # Each item is then tested by comparing a model with that item freed against
+  # this single reference, so all LRTs share the same baseline.
+  # Sign convention: ΔCFI = comparison CFI - reference CFI.
+  # Positive ΔCFI means freeing the item improved fit → DIF present.
+  ref_model_purification <- build_mgcfa_model(
+    items        = valid_anchors,
+    anchor_items = valid_anchors,
+    ordinal      = TRUE,
+    data         = pair_data
+  )
+
+  cat("Fitting purification reference model (all anchors constrained)...\n")
+  ref_fit_purification <- tryCatch(
+    cfa(ref_model_purification, data = pair_data, group = "group",
+        ordered = TRUE, estimator = "WLSMV", std.lv = TRUE),
+    error = function(e) {
+      cat(sprintf("Reference model error: %s\n", e$message))
+      NULL
+    }
+  )
+
+  if (is.null(ref_fit_purification) || !lavInspect(ref_fit_purification, "converged")) {
+    cat("Purification reference model did not converge. Cannot proceed.\n")
+    return(NULL)
+  }
+
+  ref_indices_pur <- fitMeasures(ref_fit_purification, c("cfi", "tli"))
+  cat(sprintf("Reference model: CFI = %.4f, TLI = %.4f\n\n",
+              ref_indices_pur["cfi"], ref_indices_pur["tli"]))
+
+  # Results table — one row per anchor item
   fit_differences <- data.frame(
-    item = valid_anchors,
-    delta_cfi = NA_real_,
-    delta_tli = NA_real_,
-    cfi_constrained = NA_real_,
-    cfi_free = NA_real_,
-    tli_constrained = NA_real_,
-    tli_free = NA_real_,
-    converged = FALSE,
+    item           = valid_anchors,
+    chi_sq         = NA_real_,
+    df             = NA_real_,
+    p_value        = NA_real_,
+    delta_cfi      = NA_real_,
+    delta_tli      = NA_real_,
+    cfi_reference  = NA_real_,
+    cfi_comparison = NA_real_,
+    tli_reference  = NA_real_,
+    tli_comparison = NA_real_,
+    converged      = FALSE,
     stringsAsFactors = FALSE
   )
-  
+
   for (i in seq_along(valid_anchors)) {
-    tested_item <- valid_anchors[i]
+    tested_item  <- valid_anchors[i]
     temp_anchors <- valid_anchors[-i]
-    
+
     cat(sprintf("Testing item %d/%d: %s\n", i, length(valid_anchors), tested_item))
-    
-    # Build constrained model (tested item parameters equal across groups)
-    constrained_model <- build_mgcfa_model(
-      items = c(tested_item, temp_anchors),
-      anchor_items = valid_anchors,  # All items constrained
-      ordinal = TRUE
+
+    # Comparison model: full item set, tested item freed across groups
+    comparison_model <- build_mgcfa_model(
+      items        = valid_anchors,
+      anchor_items = temp_anchors,
+      ordinal      = TRUE,
+      data         = pair_data
     )
-    
-    # Build free model (tested item parameters free across groups)
-    free_model <- build_mgcfa_model(
-      items = c(tested_item, temp_anchors),
-      anchor_items = temp_anchors,  # Only temp anchors constrained
-      ordinal = TRUE
-    )
-    
-    # Fit models
+
     tryCatch({
-      fit_constrained <- cfa(constrained_model, data = pair_data, 
-                             group = "group", ordered = TRUE,
-                             estimator = "WLSMV", std.lv = TRUE)
-      
-      fit_free <- cfa(free_model, data = pair_data, 
-                      group = "group", ordered = TRUE,
-                      estimator = "WLSMV", std.lv = TRUE)
-      
-      if (lavInspect(fit_constrained, "converged") && 
-          lavInspect(fit_free, "converged")) {
-        
-        # Extract fit indices
-        fit_constrained_indices <- fitMeasures(fit_constrained, c("cfi", "tli"))
-        fit_free_indices <- fitMeasures(fit_free, c("cfi", "tli"))
-        
-        fit_differences$cfi_constrained[i] <- fit_constrained_indices["cfi"]
-        fit_differences$cfi_free[i] <- fit_free_indices["cfi"]
-        fit_differences$tli_constrained[i] <- fit_constrained_indices["tli"]
-        fit_differences$tli_free[i] <- fit_free_indices["tli"]
-        
-        # Calculate differences (free - constrained; positive = improvement)
-        fit_differences$delta_cfi[i] <- fit_free_indices["cfi"] - fit_constrained_indices["cfi"]
-        fit_differences$delta_tli[i] <- fit_free_indices["tli"] - fit_constrained_indices["tli"]
+      fit_comparison <- cfa(comparison_model, data = pair_data,
+                            group = "group", ordered = TRUE,
+                            estimator = "WLSMV", std.lv = TRUE)
+
+      if (lavInspect(fit_comparison, "converged")) {
+
+        # LRT: reference (more constrained) vs comparison (item freed)
+        lr_test <- lavTestLRT(ref_fit_purification, fit_comparison,
+                              method = "satorra.2000")
+
+        fit_differences$chi_sq[i]  <- lr_test$`Chisq diff`[2]
+        fit_differences$df[i]      <- lr_test$`Df diff`[2]
+        fit_differences$p_value[i] <- lr_test$`Pr(>Chisq)`[2]
+
+        comp_indices <- fitMeasures(fit_comparison, c("cfi", "tli"))
+
+        fit_differences$cfi_reference[i]  <- ref_indices_pur["cfi"]
+        fit_differences$cfi_comparison[i] <- comp_indices["cfi"]
+        fit_differences$tli_reference[i]  <- ref_indices_pur["tli"]
+        fit_differences$tli_comparison[i] <- comp_indices["tli"]
+
+        # ΔCFI = comparison - reference (positive = freeing item improved fit = DIF)
+        fit_differences$delta_cfi[i] <- comp_indices["cfi"] - ref_indices_pur["cfi"]
+        fit_differences$delta_tli[i] <- comp_indices["tli"] - ref_indices_pur["tli"]
         fit_differences$converged[i] <- TRUE
-        
-        cat(sprintf("  ΔCFI = %.4f, ΔTLI = %.4f\n", 
-                    fit_differences$delta_cfi[i], 
+
+        cat(sprintf("  χ²(%.0f) = %.2f, p = %.4f, ΔCFI = %.4f, ΔTLI = %.4f\n",
+                    fit_differences$df[i], fit_differences$chi_sq[i],
+                    fit_differences$p_value[i],
+                    fit_differences$delta_cfi[i],
                     fit_differences$delta_tli[i]))
       } else {
-        cat("  Model did not converge\n")
+        cat("  Comparison model did not converge\n")
       }
     }, error = function(e) {
       cat(sprintf("  Error: %s\n", e$message))
     })
   }
-  
+
   # Filter to converged items
   converged_results <- fit_differences %>%
     filter(converged)
-  
+
   if (nrow(converged_results) == 0) {
     cat("\nNo items converged successfully\n")
     return(NULL)
   }
-  
+
   # Calculate composite DIF indicator (average of absolute differences)
   converged_results <- converged_results %>%
     mutate(
@@ -188,48 +218,42 @@ purify_anchors <- function(data, anchor_items, study1, study2,
       composite_dif = (abs_delta_cfi + abs_delta_tli) / 2
     ) %>%
     arrange(composite_dif)
-  
+
   # Identify items with potential DIF
   # Items show DIF if ΔCFI or ΔTLI exceed thresholds
   converged_results <- converged_results %>%
     mutate(
       shows_dif = abs_delta_cfi > cfi_threshold | abs_delta_tli > tli_threshold
     )
-  
-  n_no_dif <- sum(!converged_results$shows_dif)
+
+  n_no_dif   <- sum(!converged_results$shows_dif)
   n_with_dif <- sum(converged_results$shows_dif)
-  
+
   cat("\nPURIFICATION RESULTS:\n")
   cat(sprintf("Items tested: %d\n", nrow(converged_results)))
-  cat(sprintf("Items with no DIF (ΔCFI ≤ %.3f, ΔTLI ≤ %.3f): %d\n", 
+  cat(sprintf("Items with no DIF (ΔCFI ≤ %.3f, ΔTLI ≤ %.3f): %d\n",
               cfi_threshold, tli_threshold, n_no_dif))
   cat(sprintf("Items with potential DIF: %d\n\n", n_with_dif))
-  
+
   # Select purified anchors
   if (n_no_dif >= min_anchors) {
-    # Use all items without DIF
     purified_anchors <- converged_results %>%
       filter(!shows_dif) %>%
       pull(item)
-    
     cat(sprintf("Using %d items with no DIF as purified anchors:\n", length(purified_anchors)))
-    
   } else {
-    # All items show DIF - select top 3 (or min_anchors) with smallest composite DIF
     n_select <- min(min_anchors, nrow(converged_results))
     purified_anchors <- converged_results %>%
       slice_head(n = n_select) %>%
       pull(item)
-    
-    cat(sprintf("All items show potential DIF. Selecting %d items with smallest differences:\n", 
+    cat(sprintf("All items show potential DIF. Selecting %d items with smallest differences:\n",
                 n_select))
   }
-  
-  # Display purified anchors with their fit differences
+
   purified_info <- converged_results %>%
     filter(item %in% purified_anchors) %>%
     select(item, delta_cfi, delta_tli, composite_dif)
-  
+
   for (i in 1:nrow(purified_info)) {
     cat(sprintf("  %s: ΔCFI = %.4f, ΔTLI = %.4f, Composite = %.4f\n",
                 purified_info$item[i],
@@ -238,13 +262,13 @@ purify_anchors <- function(data, anchor_items, study1, study2,
                 purified_info$composite_dif[i]))
   }
   cat("\n")
-  
+
   return(list(
     purified_anchors = purified_anchors,
-    fit_differences = converged_results,
-    valid_anchors = valid_anchors,
-    n_no_dif = n_no_dif,
-    n_with_dif = n_with_dif
+    fit_differences  = converged_results,
+    valid_anchors    = valid_anchors,
+    n_no_dif         = n_no_dif,
+    n_with_dif       = n_with_dif
   ))
 }
 
@@ -252,119 +276,143 @@ purify_anchors <- function(data, anchor_items, study1, study2,
 # STEP 3: FORMAL DIF TESTING WITH PURIFIED ANCHORS
 # =============================================================================
 
-formal_dif_testing <- function(data, purified_result, study1, study2, 
+formal_dif_testing <- function(data, purified_result, study1, study2,
                                study_var = "Study", alpha = 0.05,
                                cfi_threshold = 0.01, tli_threshold = 0.01) {
-  
+
   cat(sprintf("\nSTEP 3: FORMAL DIF TESTING FOR %s vs %s\n", study1, study2))
   cat("===========================================\n\n")
-  
+
   if (is.null(purified_result)) {
     cat("No purified anchors available\n")
     return(NULL)
   }
-  
+
   purified_anchors <- purified_result$purified_anchors
-  all_items <- purified_result$valid_anchors
-  studied_items <- setdiff(all_items, purified_anchors)
-  
+  all_items        <- purified_result$valid_anchors
+  studied_items    <- setdiff(all_items, purified_anchors)
+
   if (length(studied_items) == 0) {
     cat("No items left to test after purification\n")
     return(NULL)
   }
-  
+
   # Filter to relevant studies
   pair_data <- data %>%
     filter(!!sym(study_var) %in% c(study1, study2)) %>%
     mutate(group = as.factor(!!sym(study_var)))
-  
-  # Test each studied item
+
+  full_item_set <- c(studied_items, purified_anchors)
+
+  # --- Estimate shared reference model ONCE ---
+  # Reference: anchors constrained, ALL studied items free.
+  # Each item is then tested by additionally constraining it (comparison model)
+  # and comparing that more-constrained model back to this reference.
+  # Sign convention differs from purification: here comparison is MORE constrained,
+  # so ΔCFI = reference CFI - comparison CFI. Positive = constraining item worsened
+  # fit = DIF present. Both stages yield positive ΔCFI when DIF is detected.
+  ref_model_formal <- build_mgcfa_model(
+    items        = full_item_set,
+    anchor_items = purified_anchors,
+    ordinal      = TRUE,
+    data         = pair_data
+  )
+
+  cat("Fitting formal testing reference model (anchors constrained, studied items free)...\n")
+  ref_fit_formal <- tryCatch(
+    cfa(ref_model_formal, data = pair_data, group = "group",
+        ordered = TRUE, estimator = "WLSMV", std.lv = TRUE),
+    error = function(e) {
+      cat(sprintf("Reference model failed for %s vs %s: %s\n", study1, study2, e$message))
+      NULL
+    }
+  )
+
+  if (is.null(ref_fit_formal) || !lavInspect(ref_fit_formal, "converged")) {
+    cat(sprintf("Formal testing reference model did not converge for %s vs %s.\n",
+                study1, study2))
+    return(NULL)
+  }
+
+  ref_indices <- fitMeasures(ref_fit_formal, c("cfi", "tli"))
+  cat(sprintf("Reference model: CFI = %.4f, TLI = %.4f\n\n",
+              ref_indices["cfi"], ref_indices["tli"]))
+
+  # Results table — one row per studied item
   dif_results <- data.frame(
-    item = studied_items,
-    chi_sq = NA_real_,
-    df = NA_real_,
-    p_value = NA_real_,
-    delta_cfi = NA_real_,
-    delta_tli = NA_real_,
-    cfi_constrained = NA_real_,
-    cfi_free = NA_real_,
-    tli_constrained = NA_real_,
-    tli_free = NA_real_,
-    converged = FALSE,
+    item           = studied_items,
+    chi_sq         = NA_real_,
+    df             = NA_real_,
+    p_value        = NA_real_,
+    delta_cfi      = NA_real_,
+    delta_tli      = NA_real_,
+    cfi_reference  = NA_real_,
+    cfi_comparison = NA_real_,
+    tli_reference  = NA_real_,
+    tli_comparison = NA_real_,
+    converged      = FALSE,
     stringsAsFactors = FALSE
   )
-  
+
   for (i in seq_along(studied_items)) {
     tested_item <- studied_items[i]
-    
+
     cat(sprintf("Testing item %d/%d: %s\n", i, length(studied_items), tested_item))
-    
-    # Constrained model
-    constrained_model <- build_mgcfa_model(
-      items = c(tested_item, purified_anchors),
+
+    # Comparison model: same full item set, tested item additionally constrained
+    comparison_model <- build_mgcfa_model(
+      items        = full_item_set,
       anchor_items = c(tested_item, purified_anchors),
-      ordinal = TRUE
+      ordinal      = TRUE,
+      data         = pair_data
     )
-    
-    # Free model
-    free_model <- build_mgcfa_model(
-      items = c(tested_item, purified_anchors),
-      anchor_items = purified_anchors,
-      ordinal = TRUE
-    )
-    
+
     tryCatch({
-      fit_constrained <- cfa(constrained_model, data = pair_data,
-                             group = "group", ordered = TRUE,
-                             estimator = "WLSMV", std.lv = TRUE)
-      
-      fit_free <- cfa(free_model, data = pair_data,
-                      group = "group", ordered = TRUE,
-                      estimator = "WLSMV", std.lv = TRUE)
-      
-      if (lavInspect(fit_constrained, "converged") && 
-          lavInspect(fit_free, "converged")) {
-        
-        # Likelihood ratio test
-        lr_test <- lavTestLRT(fit_constrained, fit_free, method = "satorra.2000")
-        
-        dif_results$chi_sq[i] <- lr_test$`Chisq diff`[2]
-        dif_results$df[i] <- lr_test$`Df diff`[2]
+      fit_comparison <- cfa(comparison_model, data = pair_data,
+                            group = "group", ordered = TRUE,
+                            estimator = "WLSMV", std.lv = TRUE)
+
+      if (lavInspect(fit_comparison, "converged")) {
+
+        # LRT: comparison (more constrained) vs reference (less constrained)
+        lr_test <- lavTestLRT(fit_comparison, ref_fit_formal, method = "satorra.2000")
+
+        dif_results$chi_sq[i]  <- lr_test$`Chisq diff`[2]
+        dif_results$df[i]      <- lr_test$`Df diff`[2]
         dif_results$p_value[i] <- lr_test$`Pr(>Chisq)`[2]
-        
-        # Extract fit indices
-        fit_constrained_indices <- fitMeasures(fit_constrained, c("cfi", "tli"))
-        fit_free_indices <- fitMeasures(fit_free, c("cfi", "tli"))
-        
-        dif_results$cfi_constrained[i] <- fit_constrained_indices["cfi"]
-        dif_results$cfi_free[i] <- fit_free_indices["cfi"]
-        dif_results$tli_constrained[i] <- fit_constrained_indices["tli"]
-        dif_results$tli_free[i] <- fit_free_indices["tli"]
-        
-        dif_results$delta_cfi[i] <- fit_free_indices["cfi"] - fit_constrained_indices["cfi"]
-        dif_results$delta_tli[i] <- fit_free_indices["tli"] - fit_constrained_indices["tli"]
+
+        comp_indices <- fitMeasures(fit_comparison, c("cfi", "tli"))
+
+        dif_results$cfi_reference[i]  <- ref_indices["cfi"]
+        dif_results$cfi_comparison[i] <- comp_indices["cfi"]
+        dif_results$tli_reference[i]  <- ref_indices["tli"]
+        dif_results$tli_comparison[i] <- comp_indices["tli"]
+
+        # ΔCFI = reference - comparison (positive = constraining item worsened fit = DIF)
+        dif_results$delta_cfi[i] <- ref_indices["cfi"] - comp_indices["cfi"]
+        dif_results$delta_tli[i] <- ref_indices["tli"] - comp_indices["tli"]
         dif_results$converged[i] <- TRUE
-        
-        cat(sprintf("  χ²(%.0f) = %.2f, p = %.4f, ΔCFI = %.4f, ΔTLI = %.4f\n", 
+
+        cat(sprintf("  χ²(%.0f) = %.2f, p = %.4f, ΔCFI = %.4f, ΔTLI = %.4f\n",
                     dif_results$df[i], dif_results$chi_sq[i], dif_results$p_value[i],
                     dif_results$delta_cfi[i], dif_results$delta_tli[i]))
       } else {
-        cat("  Model did not converge\n")
+        cat("  Comparison model did not converge\n")
       }
     }, error = function(e) {
       cat(sprintf("  Error: %s\n", e$message))
     })
   }
-  
+
   # Filter to converged items
   dif_results <- dif_results %>%
     filter(converged, !is.na(p_value))
-  
+
   if (nrow(dif_results) == 0) {
     cat("\nNo items converged successfully\n")
     return(NULL)
   }
-  
+
   # Apply Benjamini-Hochberg correction
   dif_results <- dif_results %>%
     arrange(p_value) %>%
@@ -375,29 +423,28 @@ formal_dif_testing <- function(data, purified_result, study1, study2,
       # Also flag items with substantial fit differences
       substantial_cfi_diff = abs(delta_cfi) > cfi_threshold,
       substantial_tli_diff = abs(delta_tli) > tli_threshold,
-      dif_by_fit_indices = substantial_cfi_diff | substantial_tli_diff
+      dif_by_fit_indices   = substantial_cfi_diff | substantial_tli_diff
     )
-  
-  n_sig_lr <- sum(dif_results$significant_BH, na.rm = TRUE)
+
+  n_sig_lr  <- sum(dif_results$significant_BH, na.rm = TRUE)
   n_sig_fit <- sum(dif_results$dif_by_fit_indices, na.rm = TRUE)
-  
-  cat(sprintf("\nItems with significant DIF (BH-adjusted α = %.2f): %d\n", 
+
+  cat(sprintf("\nItems with significant DIF (BH-adjusted α = %.2f): %d\n",
               alpha, n_sig_lr))
   cat(sprintf("Items with substantial fit differences (ΔCFI > %.3f or ΔTLI > %.3f): %d\n",
               cfi_threshold, tli_threshold, n_sig_fit))
-  
-  # Display significant items
+
   if (n_sig_lr > 0) {
     cat("\nSignificant DIF items (LR test):\n")
     sig_items <- dif_results %>% filter(significant_BH)
     for (i in 1:nrow(sig_items)) {
       cat(sprintf("  %s: p = %.4f (threshold = %.4f), ΔCFI = %.4f, ΔTLI = %.4f\n",
-                  sig_items$item[i], sig_items$p_value[i], 
+                  sig_items$item[i], sig_items$p_value[i],
                   sig_items$bh_threshold[i],
                   sig_items$delta_cfi[i], sig_items$delta_tli[i]))
     }
   }
-  
+
   if (n_sig_fit > 0 && n_sig_fit != n_sig_lr) {
     cat("\nItems with substantial fit differences:\n")
     fit_items <- dif_results %>% filter(dif_by_fit_indices, !significant_BH)
@@ -409,11 +456,11 @@ formal_dif_testing <- function(data, purified_result, study1, study2,
     }
   }
   cat("\n")
-  
+
   return(list(
-    dif_results = dif_results,
+    dif_results      = dif_results,
     purified_anchors = purified_anchors,
-    studied_items = studied_items
+    studied_items    = studied_items
   ))
 }
 
@@ -459,17 +506,19 @@ assess_dif_impact <- function(data, formal_results, study1, study2,
   model1 <- build_mgcfa_model(
     items = all_items,
     anchor_items = all_items,
-    ordinal = TRUE
+    ordinal = TRUE,
+    data = pair_data
   )
-  
+
   fit1 <- cfa(model1, data = pair_data, group = "group",
               ordered = TRUE, estimator = "WLSMV", std.lv = TRUE)
-  
+
   # Model 2: DIF items free
   model2 <- build_mgcfa_model(
     items = all_items,
     anchor_items = setdiff(all_items, dif_items),
-    ordinal = TRUE
+    ordinal = TRUE,
+    data = pair_data
   )
   
   fit2 <- cfa(model2, data = pair_data, group = "group",
@@ -628,29 +677,43 @@ assess_dif_impact <- function(data, formal_results, study1, study2,
 # HELPER FUNCTION: BUILD MGCFA MODEL SYNTAX
 # =============================================================================
 
-build_mgcfa_model <- function(items, anchor_items, ordinal = TRUE) {
-  
+build_mgcfa_model <- function(items, anchor_items, ordinal = TRUE, data = NULL) {
+
   # Factor loadings
   model <- paste0("distress =~ ", paste(items, collapse = " + "), "\n")
-  
+
   # Group invariance constraints for anchors
   if (length(anchor_items) > 0) {
     for (item in items) {
       if (item %in% anchor_items) {
         # Constrain loadings
         model <- paste0(model, "distress =~ c(lambda_", item, ", lambda_", item, ") * ", item, "\n")
-        
-        # If ordinal, also constrain thresholds
+
+        # If ordinal, constrain thresholds — number derived from observed categories
         if (ordinal) {
-          model <- paste0(model, item, " | c(tau1_", item, ", tau1_", item, ") * t1\n")
-          model <- paste0(model, item, " | c(tau2_", item, ", tau2_", item, ") * t2\n")
-          model <- paste0(model, item, " | c(tau3_", item, ", tau3_", item, ") * t3\n")
-          model <- paste0(model, item, " | c(tau4_", item, ", tau4_", item, ") * t4\n")
+          if (!is.null(data) && item %in% names(data)) {
+            item_values <- data[[item]]
+            if ("group" %in% names(data)) {
+              for (g in unique(data$group)) {
+                g_vals <- item_values[data$group == g]
+                if (length(unique(g_vals[!is.na(g_vals)])) < 2) {
+                  warning(sprintf("Item '%s' has fewer than 2 observed categories in group '%s'", item, g))
+                }
+              }
+            }
+            n_cats      <- length(unique(item_values[!is.na(item_values)]))
+            n_thresholds <- max(1L, n_cats - 1L)
+          } else {
+            n_thresholds <- 4L
+          }
+          for (t in seq_len(n_thresholds)) {
+            model <- paste0(model, item, " | c(tau", t, "_", item, ", tau", t, "_", item, ") * t", t, "\n")
+          }
         }
       }
     }
   }
-  
+
   return(model)
 }
 
